@@ -1,12 +1,14 @@
 use crate::config::Catalog;
 use crate::scanner::FileInfo;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
-use exif::{Reader, Tag, In, Value};
-use image::ImageFormat; // Added image import
+use exif;
+use image::{ImageFormat, DynamicImage, codecs::jpeg::JpegEncoder};
+use libraw::{Processor};
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 // --- エラー型定義 ---
 type ProcessorResult<T> = Result<T, Box<dyn Error>>;
@@ -92,6 +94,50 @@ pub fn process_file(
 
 // --- ヘルパー関数 ---
 
+/// 拡大を防ぐリサイズ関数。最大サイズより小さい場合は元のサイズを保持
+fn resize_without_upscaling(img: DynamicImage, max_size: u32) -> DynamicImage {
+    let (width, height) = (img.width(), img.height());
+    let max_dimension = width.max(height);
+    
+    if max_dimension <= max_size {
+        // 元画像が最大サイズより小さい場合はそのまま返す
+        println!("  Image size {}x{} is smaller than max {}, keeping original size", 
+                width, height, max_size);
+        img
+    } else {
+        // 長辺を基準にアスペクト比を保ってリサイズ
+        let thumbnail = img.thumbnail(max_size, max_size);
+        println!("  Resized from {}x{} to {}x{}", 
+                width, height, thumbnail.width(), thumbnail.height());
+        thumbnail
+    }
+}
+
+/// クオリティ指定でJPEGサムネイルを保存するヘルパー関数
+fn save_jpeg_thumbnail(
+    img: &DynamicImage,
+    path: &Path,
+    quality: u8, // 1-10 scale
+) -> Result<(), Box<dyn Error>> {
+    // 1-10スケールを0-100スケールに変換 (1=10%, 10=100%)
+    let jpeg_quality = (quality * 10).min(100);
+    
+    let file = File::create(path)?;
+    let mut encoder = JpegEncoder::new_with_quality(file, jpeg_quality);
+    
+    let rgb_image = img.to_rgb8();
+    encoder.encode(
+        rgb_image.as_raw(),
+        img.width(),
+        img.height(),
+        image::ExtendedColorType::Rgb8,
+    )?;
+    
+    println!("  Saved JPEG thumbnail with quality {} ({}%) to {:?}", 
+            quality, jpeg_quality, path);
+    Ok(())
+}
+
 /// EXIF情報からメタデータ (日付, メーカー, モデル) を抽出する
 fn extract_exif_metadata(file_path: &Path) -> Metadata {
     let mut metadata = Metadata::default();
@@ -104,7 +150,7 @@ fn extract_exif_metadata(file_path: &Path) -> Metadata {
         }
     };
     let mut bufreader = BufReader::new(&file);
-    let exifreader = match Reader::new().read_from_container(&mut bufreader) {
+    let exifreader = match exif::Reader::new().read_from_container(&mut bufreader) {
         Ok(r) => r,
         Err(_) => {
             return metadata;
@@ -113,10 +159,10 @@ fn extract_exif_metadata(file_path: &Path) -> Metadata {
 
     // 日付 (DateTimeOriginal or DateTime)
     let date_tag = exifreader
-        .get_field(Tag::DateTimeOriginal, In::PRIMARY)
-        .or_else(|| exifreader.get_field(Tag::DateTime, In::PRIMARY));
+        .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
+        .or_else(|| exifreader.get_field(exif::Tag::DateTime, exif::In::PRIMARY));
     if let Some(field) = date_tag {
-        if let Value::Ascii(ref vec) = field.value {
+        if let exif::Value::Ascii(ref vec) = field.value {
             if let Some(first_vec) = vec.get(0) {
                  if let Ok(datetime_str) = std::str::from_utf8(first_vec) {
                     if let Ok(naive_dt) =
@@ -136,13 +182,13 @@ fn extract_exif_metadata(file_path: &Path) -> Metadata {
     }
 
     // メーカー (Make)
-    if let Some(field) = exifreader.get_field(Tag::Make, In::PRIMARY) {
-        metadata.camera_make = field.display_value().to_string().into();
+    if let Some(field) = exifreader.get_field(exif::Tag::Make, exif::In::PRIMARY) {
+        metadata.camera_make = Some(field.display_value().to_string());
     }
 
     // モデル (Model)
-    if let Some(field) = exifreader.get_field(Tag::Model, In::PRIMARY) {
-         metadata.camera_model = field.display_value().to_string().into();
+    if let Some(field) = exifreader.get_field(exif::Tag::Model, exif::In::PRIMARY) {
+         metadata.camera_model = Some(field.display_value().to_string());
     }
 
     // TODO: 他のメタデータも同様に抽出
@@ -155,7 +201,8 @@ fn generate_thumbnail(
     source_path: &Path,
     dest_path_base: &Path,
 ) -> ProcessorResult<Option<PathBuf>> {
-    const THUMBNAIL_WIDTH: u32 = 256; // サムネイルの幅
+    const THUMBNAIL_MAX_SIZE: u32 = 2048; // サムネイルの最大長辺サイズ
+    const THUMBNAIL_QUALITY: u8 = 6; // デフォルトのJPEGクオリティ (1-10, 10が最高画質)
 
     // ファイルタイプに応じて処理を分岐
     let ext = source_path.extension().and_then(|s| s.to_str()).unwrap_or("");
@@ -165,9 +212,58 @@ fn generate_thumbnail(
             // image クレートが拡張子からフォーマットを推測できない場合
             match ext.to_lowercase().as_str() {
                 "nef" | "cr2" | "arw" | "dng" => {
-                    // libraw-rs クレートで処理 (TODO)
-                    println!("  (RAW thumbnail generation needed for {})", ext);
-                    return Ok(None); // 仮実装: スキップ
+                    // RAWファイル処理
+                    println!("  Processing RAW file: {}", ext);
+                    match generate_raw_thumbnail(source_path, THUMBNAIL_MAX_SIZE) {
+                        Ok(Some(thumb)) => {
+                            let mut thumbnail_path = dest_path_base.to_path_buf();
+                            thumbnail_path.set_extension("jpg");
+                            match save_jpeg_thumbnail(&thumb, &thumbnail_path, THUMBNAIL_QUALITY) {
+                                Ok(_) => {
+                                    return Ok(Some(thumbnail_path));
+                                }
+                                Err(e) => {
+                                    eprintln!("  Error saving RAW thumbnail {:?}: {}", thumbnail_path, e);
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            println!("  Could not generate thumbnail from RAW file {:?}", source_path);
+                            return Ok(None);
+                        }
+                        Err(e) => {
+                            eprintln!("  Error processing RAW file {:?}: {}", source_path, e);
+                            return Ok(None);
+                        }
+                    }
+                }
+                "heic" | "heif" => {
+                    // HEIC/HEIF処理
+                    println!("  Processing HEIC/HEIF file: {}", ext);
+                    match generate_heic_thumbnail(source_path, THUMBNAIL_MAX_SIZE) {
+                        Ok(Some(thumb)) => {
+                            let mut thumbnail_path = dest_path_base.to_path_buf();
+                            thumbnail_path.set_extension("jpg");
+                            match save_jpeg_thumbnail(&thumb, &thumbnail_path, THUMBNAIL_QUALITY) {
+                                Ok(_) => {
+                                    return Ok(Some(thumbnail_path));
+                                }
+                                Err(e) => {
+                                    eprintln!("  Error saving HEIC thumbnail {:?}: {}", thumbnail_path, e);
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            println!("  Could not generate thumbnail from HEIC file {:?}", source_path);
+                            return Ok(None);
+                        }
+                        Err(e) => {
+                            eprintln!("  Error processing HEIC file {:?}: {}", source_path, e);
+                            return Ok(None);
+                        }
+                    }
                 }
                 "mov" | "mp4" | "avi" | "mts" => {
                     // ffmpeg-next クレートで処理 (TODO)
@@ -193,26 +289,297 @@ fn generate_thumbnail(
         }
     };
 
-    // リサイズ (幅を基準にアスペクト比維持)
-    let thumbnail = img.thumbnail(THUMBNAIL_WIDTH, THUMBNAIL_WIDTH);
+    // リサイズ (拡大防止機能付き)
+    let thumbnail = resize_without_upscaling(img, THUMBNAIL_MAX_SIZE);
 
     // 保存パス (.jpg)
     let mut thumbnail_path = dest_path_base.to_path_buf();
     thumbnail_path.set_extension("jpg");
 
-    // JPEG形式で保存
-    match thumbnail.save_with_format(&thumbnail_path, ImageFormat::Jpeg) {
+    // JPEG形式で保存 (クオリティ指定)
+    match save_jpeg_thumbnail(&thumbnail, &thumbnail_path, THUMBNAIL_QUALITY) {
         Ok(_) => {
-            println!("  Thumbnail saved to {:?}", thumbnail_path);
             Ok(Some(thumbnail_path))
         }
         Err(e) => {
-            // 保存エラーの場合もスキップ (エラーログは出す)
-            eprintln!("  Error saving thumbnail {:?}: {}", thumbnail_path, e);
+            eprintln!("  Error saving image thumbnail {:?}: {}", thumbnail_path, e);
             Ok(None)
         }
     }
 }
+
+/// libraw-rs を使ってRAWファイルのサムネイルを生成するヘルパー関数
+fn generate_raw_thumbnail(
+    raw_path: &Path,
+    target_width: u32,
+) -> Result<Option<DynamicImage>, Box<dyn Error>> {
+    // ファイルを読み込む (libraw-rs はバイトバッファを受け取る)
+    let file_data = std::fs::read(raw_path)?;
+    
+    // Processorを作成してRAW画像を処理
+    let processor = Processor::new();
+    
+    // RAW画像を8ビットRGBで処理
+    println!("  Processing RAW image to RGB...");
+    let processed_image = match processor.process_8bit(&file_data) {
+        Ok(img) => img,
+        Err(e) => {
+            eprintln!("  Failed to process RAW file: {}", e);
+            println!("  Attempting alternative processing methods...");
+            
+            // 1. 16ビット処理を試行
+            match Processor::new().process_16bit(&file_data) {
+                Ok(img16) => {
+                    // 16ビットから8ビットに変換
+                    let width = img16.width();
+                    let height = img16.height();
+                    let data16: &[u16] = &img16;
+                    let data8: Vec<u8> = data16.iter().map(|&x| (x >> 8) as u8).collect();
+                    
+                    if let Some(image_buffer) = image::ImageBuffer::from_raw(width, height, data8) {
+                        let dynamic_img = DynamicImage::ImageRgb8(image_buffer);
+                        let thumbnail = resize_without_upscaling(dynamic_img, target_width);
+                        println!("  RAW thumbnail generated via 16-bit fallback: {}x{} -> {}x{}", 
+                                width, height, thumbnail.width(), thumbnail.height());
+                        return Ok(Some(thumbnail));
+                    }
+                }
+                Err(e2) => {
+                    eprintln!("  16-bit processing also failed: {}", e2);
+                }
+            }
+            
+            // 2. 埋め込みプレビュー画像の抽出を試行（特にDNGファイル用）
+            println!("  Attempting to extract embedded preview image...");
+            match extract_dng_preview(raw_path) {
+                Ok(Some(preview_img)) => {
+                    let (orig_width, orig_height) = (preview_img.width(), preview_img.height());
+                    let thumbnail = resize_without_upscaling(preview_img, target_width);
+                    println!("  RAW thumbnail generated from embedded preview: {}x{} -> {}x{}", 
+                            orig_width, orig_height, thumbnail.width(), thumbnail.height());
+                    return Ok(Some(thumbnail));
+                }
+                Ok(None) => {
+                    println!("  No embedded preview found");
+                }
+                Err(e3) => {
+                    eprintln!("  Preview extraction failed: {}", e3);
+                }
+            }
+            
+            // 3. 最終手段: sipsコマンドでDNGをJPEGに変換 (macOS)
+            if raw_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase() == "dng" {
+                println!("  Attempting DNG conversion using sips...");
+                match convert_dng_with_sips(raw_path, target_width) {
+                    Ok(Some(thumb)) => {
+                        println!("  DNG thumbnail generated via sips conversion: {}x{}", 
+                                thumb.width(), thumb.height());
+                        return Ok(Some(thumb));
+                    }
+                    Ok(None) => {
+                        println!("  sips conversion failed");
+                    }
+                    Err(e4) => {
+                        eprintln!("  sips conversion error: {}", e4);
+                    }
+                }
+            }
+            
+            return Ok(None);
+        }
+    };
+    
+    let width = processed_image.width();
+    let height = processed_image.height();
+    let rgb_data: &[u8] = &processed_image;
+    
+    // RGB8データからDynamicImageを作成
+    // libraw-rs のProcessedImageは3チャンネル(RGB)のデータを返す
+    // データサイズが期待値と一致するかチェック
+    let expected_size = (width * height * 3) as usize; // RGB = 3 bytes per pixel
+    if rgb_data.len() == expected_size {
+        if let Some(image_buffer) = image::ImageBuffer::from_raw(width, height, rgb_data.to_vec()) {
+            let dynamic_img = DynamicImage::ImageRgb8(image_buffer);
+            let thumbnail = resize_without_upscaling(dynamic_img, target_width);
+            return Ok(Some(thumbnail));
+        }
+    } else {
+        eprintln!("  RGB data size mismatch: expected {}, got {}", expected_size, rgb_data.len());
+    }
+    
+    Ok(None)
+}
+
+/// HEIC/HEIFファイルのサムネイルを生成するヘルパー関数
+/// macOSのsipsコマンドを使用してHEICをJPEGに変換してからサムネイル生成
+fn generate_heic_thumbnail(
+    heic_path: &Path,
+    target_width: u32,
+) -> Result<Option<DynamicImage>, Box<dyn Error>> {
+    // 一時的な変換ファイルパス
+    let temp_dir = std::env::temp_dir();
+    let temp_file = temp_dir.join(format!("casket_temp_{}.jpg", 
+        std::process::id()));
+    
+    println!("  Converting HEIC to JPEG using sips...");
+    
+    // sipsコマンドでHEICをJPEGに変換
+    let output = Command::new("sips")
+        .arg("-s")
+        .arg("format")
+        .arg("jpeg")
+        .arg(heic_path)
+        .arg("--out")
+        .arg(&temp_file)
+        .output()?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("  sips command failed: {}", stderr);
+        return Ok(None);
+    }
+    
+    // 変換されたJPEGファイルからサムネイルを生成
+    let result = if temp_file.exists() {
+        match image::open(&temp_file) {
+            Ok(img) => {
+                let thumbnail = resize_without_upscaling(img, target_width);
+                println!("  HEIC thumbnail generated via sips conversion: {}x{}", 
+                        thumbnail.width(), thumbnail.height());
+                Some(thumbnail)
+            }
+            Err(e) => {
+                eprintln!("  Error opening converted JPEG: {}", e);
+                None
+            }
+        }
+    } else {
+        eprintln!("  Converted JPEG file not found");
+        None
+    };
+    
+    // 一時ファイルを削除
+    if temp_file.exists() {
+        let _ = std::fs::remove_file(&temp_file);
+    }
+    
+    Ok(result)
+}
+
+/// DNG/RAWファイルから埋め込みプレビュー画像を抽出する関数
+/// EXIFメタデータを使用してプレビュー画像のオフセットと長さを取得
+fn extract_dng_preview(dng_path: &Path) -> Result<Option<DynamicImage>, Box<dyn Error>> {
+    let file = File::open(dng_path)?;
+    let mut bufreader = BufReader::new(&file);
+    
+    // EXIFデータからプレビュー情報を取得
+    let exif_reader = match exif::Reader::new().read_from_container(&mut bufreader) {
+        Ok(reader) => reader,
+        Err(_) => return Ok(None),
+    };
+    
+    // プレビュー画像の開始位置とサイズを取得（IFD1とPRIMALYの両方を試行）
+    let mut preview_start = None;
+    let mut preview_length = None;
+    
+    // IFD1を試行（一般的にDNGのプレビュー画像が格納される場所）
+    for ifd in [exif::In::THUMBNAIL, exif::In::PRIMARY] {
+        if preview_start.is_none() {
+            preview_start = exif_reader
+                .get_field(exif::Tag::JPEGInterchangeFormat, ifd)
+                .and_then(|field| field.value.get_uint(0));
+        }
+        
+        if preview_length.is_none() {
+            preview_length = exif_reader
+                .get_field(exif::Tag::JPEGInterchangeFormatLength, ifd)
+                .and_then(|field| field.value.get_uint(0));
+        }
+        
+        if preview_start.is_some() && preview_length.is_some() {
+            println!("  Found JPEG preview in {:?} IFD", ifd);
+            break;
+        }
+    }
+    
+    if let (Some(start), Some(length)) = (preview_start, preview_length) {
+        println!("  Found preview image at offset {} with length {}", start, length);
+        
+        // ファイルから該当部分を読み込み
+        let mut file = File::open(dng_path)?;
+        let mut buffer = vec![0u8; length as usize];
+        
+        file.seek(std::io::SeekFrom::Start(start as u64))?;
+        file.read_exact(&mut buffer)?;
+        
+        // 画像データとして読み込み
+        match image::load_from_memory(&buffer) {
+            Ok(img) => {
+                println!("  Successfully loaded embedded preview image: {}x{}", img.width(), img.height());
+                return Ok(Some(img));
+            }
+            Err(e) => {
+                eprintln!("  Failed to load preview image data: {}", e);
+            }
+        }
+    } else {
+        println!("  No preview image metadata found in EXIF");
+    }
+    
+    Ok(None)
+}
+
+/// sipsコマンドを使ってDNGファイルをJPEGに変換してサムネイル生成
+fn convert_dng_with_sips(
+    dng_path: &Path,
+    target_width: u32,
+) -> Result<Option<DynamicImage>, Box<dyn Error>> {
+    // 一時的な変換ファイルパス
+    let temp_dir = std::env::temp_dir();
+    let temp_file = temp_dir.join(format!("casket_dng_temp_{}.jpg", 
+        std::process::id()));
+    
+    // sipsコマンドでDNGをJPEGに変換
+    let output = Command::new("sips")
+        .arg("-s")
+        .arg("format")
+        .arg("jpeg")
+        .arg(dng_path)
+        .arg("--out")
+        .arg(&temp_file)
+        .output()?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("  sips DNG conversion failed: {}", stderr);
+        return Ok(None);
+    }
+    
+    // 変換されたJPEGファイルからサムネイルを生成
+    let result = if temp_file.exists() {
+        match image::open(&temp_file) {
+            Ok(img) => {
+                let thumbnail = resize_without_upscaling(img, target_width);
+                Some(thumbnail)
+            }
+            Err(e) => {
+                eprintln!("  Error opening converted DNG JPEG: {}", e);
+                None
+            }
+        }
+    } else {
+        eprintln!("  Converted DNG JPEG file not found");
+        None
+    };
+    
+    // 一時ファイルを削除
+    if temp_file.exists() {
+        let _ = std::fs::remove_file(&temp_file);
+    }
+    
+    Ok(result)
+}
+
 
 // Removed the old get_original_datetime function
 // TODO: RAWファイル用に libraw-rs を使ってメタデータを取得する処理も extract_exif_metadata に統合検討

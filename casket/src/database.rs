@@ -1,5 +1,6 @@
 use crate::processor::ProcessedInfo;
-use rusqlite::{Connection, Result};
+use chrono::SecondsFormat; // For ISO 8601 formatting
+use rusqlite::{params, Connection, Result, Transaction}; // Added params and Transaction
 use std::path::Path;
 
 /// データベース接続を開く (ファイルが存在しなければ作成される)
@@ -29,43 +30,97 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// 処理結果をデータベースに保存する (仮実装: まだ何もしない)
-pub fn save_processed_info(
-    conn: &Connection,
+/// 処理結果をデータベースに保存する (トランザクション内で使用される想定)
+fn save_processed_info_txn(
+    tx: &Transaction,
     processed_info: &ProcessedInfo,
-) -> Result<()> {
-    println!("Saving info for {:?} to database...", processed_info.original_path);
-    // TODO: processed_infoの内容を media_items テーブルにINSERTするSQLを実行する
-    // 注意: datetime_original は Option<DateTime<Local>> なので、TEXTに変換する必要がある
-    // 注意: thumbnail_path も Option<PathBuf> なので、TEXTまたはNULLに変換する必要がある
-    // 注意: original_path が UNIQUE なので、重複挿入はエラーになる (これをハンドリングするか、事前にチェックするか)
-    Ok(())
+) -> Result<usize> { // Returns number of affected rows (0 if ignored)
+    // println!("Saving info for {:?} to database...", processed_info.original_path); // Logged in save_all
+
+    // Convert Option<DateTime> to Option<String> (ISO 8601)
+    let datetime_str = processed_info
+        .metadata
+        .datetime_original
+        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true)); // Use RFC3339 (ISO 8601 compatible)
+
+    // Convert PathBufs to Strings (handle potential non-UTF8 paths?)
+    let original_path_str = processed_info.original_path.to_string_lossy().to_string();
+    let data_path_str = processed_info.data_dest_path.to_string_lossy().to_string();
+    let thumbnail_path_str = processed_info
+        .thumbnail_dest_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string());
+
+    // INSERT OR IGNORE: 重複する original_path があれば挿入をスキップする
+    tx.execute(
+        "INSERT OR IGNORE INTO media_items (
+            original_path, data_path, thumbnail_path,
+            datetime_original, camera_make, camera_model
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            original_path_str,
+            data_path_str,
+            thumbnail_path_str,
+            datetime_str,
+            processed_info.metadata.camera_make,
+            processed_info.metadata.camera_model,
+        ],
+    )
 }
 
-/// 複数の処理結果をまとめてデータベースに保存する (仮実装: 各要素をsave_processed_infoで処理)
+/// 複数の処理結果をまとめてデータベースに保存する (トランザクション使用)
 pub fn save_all_processed_info(
-    conn: &Connection,
+    conn: &mut Connection, // Needs mutable connection for transaction
     results: &[ProcessedInfo],
 ) -> Result<()> {
-    // TODO: トランザクションを使って効率化・原子性を担保する
     println!("\nSaving all processed info to database...");
+    let tx = conn.transaction()?; // Start transaction
+
     let mut saved_count = 0;
+    let mut ignored_count = 0;
     let mut error_count = 0;
+
     for info in results {
-        match save_processed_info(conn, info) {
-            Ok(_) => saved_count += 1,
+        match save_processed_info_txn(&tx, info) {
+            Ok(affected_rows) => {
+                if affected_rows > 0 {
+                    saved_count += 1;
+                    println!("  Saved info for {:?}", info.original_path);
+                } else {
+                    ignored_count += 1;
+                     println!("  Ignored duplicate entry for {:?}", info.original_path);
+                }
+            }
             Err(e) => {
                 eprintln!("  Error saving info for {:?}: {}", info.original_path, e);
                 error_count += 1;
-                // エラーがあっても続行する (個別エラーとして扱う)
+                // トランザクション内のエラーは通常ロールバックすべきだが、
+                // ここでは個別の挿入エラーとして扱い、処理を続行する方針
+                // (ロールバックする場合は早期リターン `Err(e)?` または `tx.rollback()?` を使う)
             }
         }
     }
-    println!("Database save complete. {} records saved, {} errors.", saved_count, error_count);
-    if error_count > 0 {
+
+    if error_count == 0 {
+        tx.commit()?; // Commit transaction if no errors occurred during iteration
+        println!(
+            "Database save complete. {} new records saved, {} duplicates ignored.",
+            saved_count, ignored_count
+        );
+    } else {
+        // エラーがあった場合、コミットせずにロールバックすることも検討できるが、
+        // ここでは個別のエラーとして扱い、成功分はコミットする方針
+        // (ただし、上記ループ内でエラー時に早期リターンしていないため、
+        //  エラーがあっても tx.commit() が呼ばれる。より厳密なエラー処理が必要なら要修正)
+         tx.commit()?; // ここではエラーがあってもコミットする
+         eprintln!(
+             "Database save finished with errors. {} new records saved, {} duplicates ignored, {} errors.",
+             saved_count, ignored_count, error_count
+         );
          eprintln!("Please check database save errors above.");
-         // 必要であればここでエラーを返すことも検討
-         // return Err(...)
+         // エラーがあったことを示すためにエラーを返すことも検討
+         // return Err(rusqlite::Error::ExecuteReturnedMoreThanOneRow); // ダミーのエラー型
     }
+
     Ok(())
 }

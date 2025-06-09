@@ -106,14 +106,15 @@ fn main() {
     // データベースへの保存
     let db_path = catalog.thumbnail_path.join("casket.db");
     match database::open_database(&db_path) {
-        Ok(conn) => {
-            if let Err(e) = database::create_tables(&conn) {
+        Ok(mut conn) => { // Make conn mutable
+            if let Err(e) = database::create_tables(&conn) { // create_tables still takes &conn
                 eprintln!("Error creating database tables: {}", e);
                 // テーブル作成エラーは致命的かもしれないので終了する
                 process::exit(1);
             }
 
-            if let Err(e) = database::save_all_processed_info(&conn, &processed_results) {
+            // Pass mutable reference to save_all_processed_info
+            if let Err(e) = database::save_all_processed_info(&mut conn, &processed_results) {
                  eprintln!("Error saving data to database: {}", e);
                  // 保存エラーは警告に留め、処理は完了とするか？
                  // ここでは警告のみ表示
