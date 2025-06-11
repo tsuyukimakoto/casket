@@ -19,6 +19,7 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
             data_path TEXT NOT NULL,           -- データ保存先パス
             thumbnail_path TEXT,               -- サムネイル保存先パス (Nullable)
             datetime_original TEXT,            -- 撮影日時 (ISO 8601形式)
+            datetime_indexed TEXT NOT NULL,    -- 絞り込み用日時 (YYYYMMDDHH形式)
             camera_make TEXT,                  -- カメラメーカー
             camera_model TEXT,                 -- カメラモデル
             imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP -- インポート日時
@@ -55,13 +56,14 @@ fn save_processed_info_txn(
     tx.execute(
         "INSERT OR IGNORE INTO media_items (
             original_path, data_path, thumbnail_path,
-            datetime_original, camera_make, camera_model
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            datetime_original, datetime_indexed, camera_make, camera_model
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             original_path_str,
             data_path_str,
             thumbnail_path_str,
             datetime_str,
+            processed_info.datetime_indexed,
             processed_info.metadata.camera_make,
             processed_info.metadata.camera_model,
         ],

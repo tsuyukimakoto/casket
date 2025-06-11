@@ -20,6 +20,7 @@ pub struct ProcessedInfo {
     pub data_dest_path: PathBuf,
     pub thumbnail_dest_path: Option<PathBuf>,
     pub metadata: Metadata,
+    pub datetime_indexed: String, // YYYYMMDDHH形式の絞り込み用日時
 }
 
 // --- メタデータ構造体 ---
@@ -82,13 +83,25 @@ pub fn process_file(
     println!("Generating thumbnail for {:?}...", file_info.path);
     let thumbnail_dest_path = generate_thumbnail(&file_info.path, &thumbnail_dest_path_base)?;
 
-    println!("Finished processing: {:?}", file_info.path);
+    // 日時インデックス生成
+    let datetime_indexed = match get_datetime_indexed(&file_info.path, &metadata) {
+        Ok(dt_indexed) => dt_indexed,
+        Err(e) => {
+            eprintln!("Error generating datetime index for {:?}: {}", file_info.path, e);
+            // フォールバック: 現在時刻を使用
+            let now = Local::now();
+            format_datetime_indexed(now)
+        }
+    };
+
+    println!("Finished processing: {:?} (indexed: {})", file_info.path, datetime_indexed);
 
     Ok(ProcessedInfo {
         original_path: file_info.path.clone(),
         data_dest_path,
         thumbnail_dest_path,
         metadata,
+        datetime_indexed,
     })
 }
 
@@ -110,6 +123,29 @@ fn resize_without_upscaling(img: DynamicImage, max_size: u32) -> DynamicImage {
         println!("  Resized from {}x{} to {}x{}", 
                 width, height, thumbnail.width(), thumbnail.height());
         thumbnail
+    }
+}
+
+/// 日時をYYYYMMDDHH形式にフォーマットする関数
+fn format_datetime_indexed(dt: DateTime<Local>) -> String {
+    dt.format("%Y%m%d%H").to_string()
+}
+
+/// ファイルから日時を取得し、YYYYMMDDHH形式でフォーマット
+/// 撮影日時が取得できない場合はファイル作成日時を使用
+fn get_datetime_indexed(file_path: &Path, metadata: &Metadata) -> Result<String, Box<dyn Error>> {
+    if let Some(datetime_original) = metadata.datetime_original {
+        // EXIFから撮影日時が取得できた場合
+        println!("  Using EXIF datetime for indexing: {}", datetime_original);
+        Ok(format_datetime_indexed(datetime_original))
+    } else {
+        // EXIFから取得できない場合はファイル作成日時を使用
+        let file_meta = std::fs::metadata(file_path)?;
+        let created_time = file_meta.created()
+            .or_else(|_| file_meta.modified())?; // 作成日時が取得できない場合は更新日時
+        let datetime = DateTime::from(created_time);
+        println!("  Using file creation time for indexing: {}", datetime);
+        Ok(format_datetime_indexed(datetime))
     }
 }
 
